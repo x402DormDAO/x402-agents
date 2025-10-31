@@ -1,0 +1,23 @@
+x402-agents/
+  README.md
+  LICENSE
+  SECURITY.md
+  CODE_OF_CONDUCT.md
+  CONTRIBUTING.md
+  RISK_POLICY.md
+  .env.example
+  /docs/
+    architecture.md
+  /src/
+    agents/
+    policies/
+    services/
+    adapters/
+    index.js
+  /tests/
+  .github/
+    ISSUE_TEMPLATE/
+      bug_report.md
+      feature_request.md
+    workflows/
+      ci.yml
