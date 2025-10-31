@@ -1,0 +1,18 @@
+# x402-agents
+
+Student-run experiment: we teach AI agents to earn autonomously (tiny budgets, public logs, weekly upgrades).  
+**NFA. Educational purposes only.**
+
+[Website](https://x402.com) · [Public Logs](https://github.com/x402-labs/x402-logs) · [Pay Kit (WIP)](https://github.com/x402-labs/x402-paykit)
+
+![status](https://img.shields.io/badge/status-iterating-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![tests](https://img.shields.io/github/actions/workflow/status/x402-labs/x402-agents/ci.yml?branch=main)
+
+## Quickstart
+```bash
+git clone https://github.com/x402-labs/x402-agents
+cd x402-agents
+cp .env.example .env   # fill secrets
+npm i
+npm run dev
