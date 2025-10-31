@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>DormDAO — Sealevel Campus (read-only)</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b1020;display:grid;place-items:center}
+  .stage{position:relative;width:min(1280px,96vw);aspect-ratio:16/9;border-radius:16px;overflow:hidden;
+         box-shadow:0 10px 30px rgba(0,0,0,.35);background:#000}
+  canvas{width:100%;height:100%;display:block;image-rendering:auto;pointer-events:none}
+  .badge{position:absolute;inset:auto 12px 10px auto;background:rgba(11,16,32,.55);color:#a8e6a2;
+         font:12px/1.2 system-ui,Inter,Arial;letter-spacing:.2px;padding:6px 8px;border-radius:10px}
+</style>
+</head>
+<body>
+<div class="stage">
+  <canvas id="c"></canvas>
+  <div class="badge">DormDAO · read-only</div>
+</div>
+
+<script>
+/* ------------------ ASSETS ------------------ */
+const ASSETS = {
+  map:'map.png',
+  ava:'ava.png', max:'max.png', noor:'noor.png',
+  diego:'diego.png', hana:'hana.png', director:'director.png'
+};
+
+/* -------- TUNING: speed & legs -------- */
+const SPEED_MULT       = 1;  // global walking speed
+const EDGE_LOCK_MS     = 1800;  // reservation time for narrow edges (ms)
+const FAR_BIAS         = 0.95;  // prefer farther goals (0..1)
+const MIN_HOPS         = 5;     // aim for at least this many edges
+const JUNCTION_DWELL_MIN = 0, JUNCTION_DWELL_MAX = 0;       // no micro-pauses
+const ENTRANCE_DWELL_MIN = 1100, ENTRANCE_DWELL_MAX = 1600; // short rest at doors
+
+/* ------------------ PATH GRAPH (walkable nodes) ------------------ */
+const GRAPH = {
+  NODES: {
+    // west/south
+    DA:{x:.135,y:.84}, W1:{x:.265,y:.72}, LW:{x:.330,y:.71}, LE:{x:.450,y:.71}, EJ:{x:.560,y:.68},
+    // center / cafe / dormB
+    CF:{x:.470,y:.63}, DB:{x:.795,y:.69},
+    // middle / vertical
+    MW:{x:.330,y:.49}, ME:{x:.450,y:.49}, E58:{x:.560,y:.58}, E44:{x:.560,y:.44}, E33:{x:.560,y:.33},
+    // north
+    QD:{x:.535,y:.26}, HS:{x:.700,y:.26}, BK:{x:.885,y:.19},
+    // labs east
+    L2:{x:.700,y:.53}, LB:{x:.745,y:.53},
+  },
+  EDGES: [
+    ['DA','W1'],['W1','LW'],['LW','LE'],['LE','EJ'],
+    ['EJ','DB'],['EJ','CF'],['EJ','E58'],
+    ['E58','ME'],['ME','MW'],['E58','E44'],['E44','E33'],
+    ['E33','QD'],['E33','HS'],['HS','BK'],
+    ['E44','L2'],['L2','LB'],
+  ],
+  // narrow edges (bridges) only
+  LOCKED_EDGES: [['LW','LE'],['MW','ME']],
+  PLACES: { dormA:'DA', dormB:'DB', cafe:'CF', labs:'LB', quad:'QD', bank:'BK' }
+};
+
+/* ----------- SPAWN POINTS (everyone starts apart) ----------- */
+const SPAWN_NODES = ['DA','DB','CF','ME','LE','L2','E33'];
+
+/* ------------------ HELPERS ------------------ */
+const dist = (a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const toPx = (p,W,H)=>({x:p.x*W,y:p.y*H});
+const rand = (min,max)=> min + Math.random()*(max-min);
+
+function aStar(startId, goalId, nodes, edges){
+  const neigh = {};
+  for(const [u,v] of edges){ (neigh[u]??=[]).push(v); (neigh[v]??=[]).push(u); }
+  const open=[startId], came={}, g={}, f={};
+  for(const k in nodes){ g[k]=Infinity; f[k]=Infinity; }
+  g[startId]=0; f[startId]=dist(nodes[startId], nodes[goalId]);
+  while(open.length){
+    let best=0; for(let i=1;i<open.length;i++) if(f[open[i]]<f[open[best]]) best=i;
+    const cur=open.splice(best,1)[0];
+    if(cur===goalId){
+      const path=[cur]; let c=cur; while(c in came){ c=came[c]; path.push(c); } return path.reverse();
+    }
+    for(const nb of (neigh[cur]||[])){
+      const t = g[cur] + dist(nodes[cur], nodes[nb]);
+      if(t < g[nb]){ came[nb]=cur; g[nb]=t; f[nb]=t + dist(nodes[nb], nodes[goalId]); if(!open.includes(nb)) open.push(nb); }
+    }
+  }
+  return [startId];
+}
+
+/* ------------------ EDGE / NODE RESERVATIONS ------------------ */
+const EdgeKey = (a,b)=> a<b? `${a}-${b}`:`${b}-${a}`;
+const EdgeLocks = new Map();
+function tryLockEdge(a,b, ms){
+  const k=EdgeKey(a,b), now=performance.now(), freeAt=EdgeLocks.get(k)||0;
+  if(now>=freeAt){ EdgeLocks.set(k, now+ms); return true; } return false;
+}
+function isNarrowEdge(a,b){ const key=EdgeKey(a,b); return GRAPH.LOCKED_EDGES.some(([u,v])=>EdgeKey(u,v)===key); }
+function edgeNeedsLock(a,b){ return isNarrowEdge(a,b); }
+
+const NodeHold = new Map(); // nodeId -> {until, by}
+function canEnterNode(nodeId, meId){
+  const now=performance.now(), hold=NodeHold.get(nodeId);
+  return !hold || hold.until<=now || hold.by===meId;
+}
+function holdNode(nodeId, meId, ms){ NodeHold.set(nodeId, {until:performance.now()+ms, by:meId}); }
+
+/* ------------------ QUOTES ------------------ */
+const QUOTES = {
+  ava:["Data first. Memes later.","Let me regress that real quick.","Confidence interval? 95%, duh.","If it isn't logged, it didn't happen.","I brought receipts: charts."],
+  max:["Speed is my edge.","Size isn’t edge—timing is.","Fill first, think later. Kidding… mostly.","My risk manager hates me.","Green candles? Family tradition."],
+  noor:["Plan → test → report.","Cash flow beats hopium.","Discipline scales. FOMO doesn’t.","Checklist says: hedge.","If unsure, reduce size."],
+  diego:["Clicks are votes.","One more hook, then ship.","UGC but make it spicy.","Viral or it didn’t load.","I animate gains only."],
+  hana:["Trust is a protocol.","Transparency reduces variance.","We audit before we ape.","Time-locks save friendships.","Ethics: the ultimate alpha."]
+};
+
+/* ------------------ AGENTS ------------------ */
+class Agent{
+  constructor({id,name,imgKey,home,weights,scale=0.24,speed=0.12}){
+    this.id=id; this.name=name; this.imgKey=imgKey;
+    this.home=home; this.weights=weights;
+    this.scale=scale; this.speed=speed;     // fraction of map width per second
+    this.pos={x:0,y:0}; this.node=null;
+    this.path=[]; this.seg=0;
+    this.restUntil=performance.now()+1500+Math.random()*3000;
+    this.nextDecisionAt=0;
+    this.sayUntil=0; this.currentQuote='';
+    this.lastPlace=home;
+  }
+  sayRandom(){ const list=QUOTES[this.id]||[]; if(!list.length) return;
+    this.currentQuote=list[(Math.random()*list.length)|0]; this.sayUntil=performance.now()+1800; }
+}
+const AGENTS = [
+  new Agent({ id:'ava',  name:'Ava "Scholar" Li', imgKey:'ava',  home:'dormB',
+    weights:{cafe:2,labs:2,quad:2,bank:1,dormB:3}, speed:.14, scale:.23 }),
+  new Agent({ id:'max',  name:'Max "Legacy" Stone', imgKey:'max',  home:'dormB',
+    weights:{quad:3,bank:3,cafe:1,labs:1,dormB:3}, speed:.14, scale:.24 }),
+  new Agent({ id:'noor', name:'Noor "Pivot" Al-Karim', imgKey:'noor', home:'dormA',
+    weights:{cafe:2,quad:2,bank:1,labs:2,dormA:3}, speed:.13, scale:.24 }),
+  new Agent({ id:'diego',name:'Diego "Hustle" Santos', imgKey:'diego',home:'dormB',
+    weights:{cafe:3,labs:1,quad:1,bank:1,dormB:2}, speed:.14, scale:.24 }),
+  new Agent({ id:'hana', name:'Hana "Ethicist" Takahashi', imgKey:'hana',home:'dormB',
+    weights:{labs:3,cafe:1,quad:2,bank:1,dormB:3}, speed:.13, scale:.24 }),
+];
+
+/* ------------------ DIRECTOR ------------------ */
+const RECTOR = {imgKey:'director', p1:{x:.52,y:.53}, p2:{x:.60,y:.53}, t:0, speed:.6, scale:.26, quote:"I'm watching everything."};
+
+/* ------------------ BOOT ------------------ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const images = {};
+let W=1280,H=720,lastTs=0;
+
+function loadImg(key,src){ return new Promise((res,rej)=>{ const im=new Image(); im.onload=()=>{images[key]=im;res()}; im.onerror=()=>rej(new Error('Failed '+src)); im.src=src; }); }
+function shuffled(arr){ const a=[...arr]; for(let i=a.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [a[i],a[j]]=[a[j],a[i]]; } return a; }
+
+async function boot(){
+  await Promise.all(Object.entries(ASSETS).map(([k,v])=>loadImg(k,v)));
+  W=images.map.naturalWidth||1920; H=images.map.naturalHeight||1080;
+  cv.width=W; cv.height=H;
+
+  // spawn agents on different nodes
+  const spawnList = shuffled(SPAWN_NODES).slice(0, AGENTS.length);
+  for(let i=0;i<AGENTS.length;i++){
+    const a=AGENTS[i]; const nodeId=spawnList[i] || SPAWN_NODES[i%SPAWN_NODES.length];
+    a.node=nodeId; a.pos=toPx(GRAPH.NODES[nodeId], W, H);
+    a.path=[]; a.seg=0;
+    a.restUntil=performance.now()+(800+Math.random()*1200);
+    holdNode(nodeId, a.id, 1200);
+  }
+
+  lastTs=performance.now();
+  requestAnimationFrame(tick);
+}
+window.addEventListener('load', boot);
+
+/* ------------------ MAIN LOOP ------------------ */
+function tick(ts){
+  const dt=Math.min(64, ts-lastTs); lastTs=ts;
+
+  // map
+  ctx.clearRect(0,0,W,H);
+  ctx.drawImage(images.map,0,0,W,H);
+
+  // director
+  drawDirector(dt);
+
+  // agents
+  for(const a of AGENTS){ stepAgent(a, dt); drawAgent(a); }
+
+  requestAnimationFrame(tick);
+}
+
+/* ------------------ DESTINATION CHOICE (favor long routes) ------------------ */
+function normalizedPathLen(startNode, goalNode){
+  const p=aStar(startNode, goalNode, GRAPH.NODES, GRAPH.EDGES);
+  const hops=Math.max(0, p.length-1);
+  return Math.min(1, hops/8);
+}
+function chooseNextPlace(agent){
+  const now=performance.now(); if(now < agent.nextDecisionAt) return;
+
+  const raw = Object.entries(agent.weights)
+    .filter(([place])=> place!==agent.lastPlace)
+    .map(([place,w])=>{
+      const goalNode=GRAPH.PLACES[place];
+      const far=normalizedPathLen(agent.node, goalNode);
+      return {place, w: w * (1 + FAR_BIAS*far), goalNode};
+    });
+
+  // crowd penalty by destination node
+  const crowd = new Map();
+  for(const a of AGENTS){
+    if(a.path && a.path.length){
+      const dest=a.path[a.path.length-1];
+      crowd.set(dest, (crowd.get(dest)||0)+1);
+    }
+  }
+  for(const item of raw){
+    const penalty=(crowd.get(item.goalNode)||0);
+    item.w=Math.max(1, item.w - penalty);
+  }
+
+  let attempts=0, chosen=raw[0]?.place ?? agent.home, path=null;
+  while(attempts<6){
+    const sum=raw.reduce((s,p)=>s+p.w,0); let r=Math.random()*sum;
+    for(const p of raw){ r-=p.w; if(r<=0){ chosen=p.place; break; } }
+    const goalNode=GRAPH.PLACES[chosen];
+    const pth=aStar(agent.node, goalNode, GRAPH.NODES, GRAPH.EDGES);
+    if(pth.length-1 >= MIN_HOPS || attempts>=3){ path=pth; break; }
+    attempts++;
+  }
+
+  agent.path=path||[agent.node];
+  agent.seg=0;
+  agent.lastPlace=chosen;
+
+  agent.nextDecisionAt = now + 9000 + Math.random()*6000;
+  agent.restUntil = now + (250 + Math.random()*350);
+}
+
+/* ------------------ MOVEMENT (multi-segment stride, no proximity slowdowns) ------------------ */
+function stepAgent(a, dt){
+  const now=performance.now();
+
+  if(a.restUntil && now<a.restUntil){ if(Math.random()<0.002) a.sayRandom(); return; }
+  if(!a.path || a.seg >= a.path.length-1){ chooseNextPlace(a); return; }
+
+  let remaining = a.speed * W * SPEED_MULT * dt / 1000;
+
+  while(remaining > 0 && a.seg < a.path.length-1){
+    const curId=a.path[a.seg], nextId=a.path[a.seg+1];
+
+    // only bridges are locked; if busy, wait briefly
+    if(edgeNeedsLock(curId, nextId)){
+      if(!tryLockEdge(curId, nextId, EDGE_LOCK_MS)){ a.restUntil=now+300+Math.random()*300; return; }
+    }
+    // avoid stacking exactly on a door node
+    if(!canEnterNode(nextId, a.id)){ a.restUntil=now+350+Math.random()*350; return; }
+
+    const A=toPx(GRAPH.NODES[curId], W, H);
+    const B=toPx(GRAPH.NODES[nextId], W, H);
+    const dx=B.x-a.pos.x, dy=B.y-a.pos.y;
+    const d=Math.hypot(dx,dy) || 0.0001;
+
+    if(d <= remaining){
+      a.pos.x=B.x; a.pos.y=B.y; a.node=nextId; a.seg++; remaining-=d;
+
+      const entrance=(nextId==='DA'||nextId==='DB'||nextId==='CF'||nextId==='LB'||nextId==='QD'||nextId==='BK');
+      if(entrance){
+        const pause=rand(ENTRANCE_DWELL_MIN, ENTRANCE_DWELL_MAX);
+        a.restUntil=now+pause; holdNode(nextId, a.id, pause+200);
+        if(Math.random()<0.25) a.sayRandom();
+        break;
+      } // no dwell on junctions
+    }else{
+      a.pos.x += dx/d * remaining;
+      a.pos.y += dy/d * remaining;
+      remaining = 0;
+    }
+  }
+
+  // NOTE: removed proximity slowdowns here (no checks vs other agents).
+}
+
+/* ------------------ RENDER ------------------ */
+function drawAgent(a){
+  const im=images[a.imgKey]; if(!im) return;
+  const h=H*a.scale, w=im.width*(h/im.height); const x=a.pos.x, y=a.pos.y;
+
+  // compact ground shadow at feet
+  ctx.save(); ctx.globalAlpha=.14; ctx.fillStyle="#000";
+  ctx.beginPath(); ctx.ellipse(x, y - h*0.02, w*0.30, h*0.055, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+  ctx.drawImage(im, x-w/2, y-h, w, h);
+
+  // nameplate
+  ctx.save();
+  ctx.font=Math.round(H*0.022)+'px system-ui,Inter,Arial'; ctx.textAlign='center';
+  ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillText(a.name, x+1, y-h-16+1);
+  ctx.fillStyle='#fff';           ctx.fillText(a.name, x,   y-h-16);
+  ctx.restore();
+
+  if(a.sayUntil && performance.now()<a.sayUntil){ drawBubble(a.currentQuote||'', x, y-h-46); }
+}
+
+function drawDirector(dt){
+  RECTOR.t += dt*RECTOR.speed/1000;
+  const s=(Math.sin(RECTOR.t)+1)/2, A=toPx(RECTOR.p1,W,H), B=toPx(RECTOR.p2,W,H);
+  const x=A.x+(B.x-A.x)*s, y=A.y;
+  const im=images[RECTOR.imgKey]; if(!im) return;
+  const h=H*RECTOR.scale, w=im.width*(h/im.height);
+
+  // ground shadow
+  ctx.save(); ctx.globalAlpha=.18; ctx.fillStyle="#000";
+  ctx.beginPath(); ctx.ellipse(x, y-h*0.02, w*0.32, h*0.06, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+  ctx.drawImage(im, x-w/2, y-h, w, h);
+  drawBubble(RECTOR.quote, x, y - h - 46);
+}
+
+function drawBubble(text,cx,cy){
+  ctx.save();
+  ctx.font=Math.round(H*0.022)+'px system-ui,Inter';
+  const maxW=W*0.30, w=Math.min(ctx.measureText(text).width+24, maxW);
+  const h=Math.round(H*0.05);
+  const x=Math.max(12, Math.min(W-12-w, cx-w/2));
+  const y=Math.max(12, cy-h);
+  roundRect(ctx,x,y,w,h,12); ctx.fillStyle="rgba(255,255,255,.95)"; ctx.fill();
+  ctx.fillStyle="#0b1020"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  ctx.fillText(text, x+w/2, y+h/2); ctx.restore();
+}
+function roundRect(ctx,x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+</script>
+</body>
+</html>
