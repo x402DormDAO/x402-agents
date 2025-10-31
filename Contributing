@@ -1,0 +1,14 @@
+
+**.env.example**
+```env
+# APIs
+HELIUS_API_KEY=
+BIRDEYE_API_KEY=
+
+# Telegram alerts (optional)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_USER_ID=
+
+# Treasury / wallets (public keys only)
+X402_AGENTS_TREASURY_PUBKEY=
+X402_ENV=dev
