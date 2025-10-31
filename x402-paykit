@@ -1,0 +1,10 @@
+x402-paykit/
+  README.md
+  LICENSE
+  ROADMAP.md
+  /examples/
+    node-basic/
+      package.json
+      index.js
+  /spec/
+    openapi.yaml
